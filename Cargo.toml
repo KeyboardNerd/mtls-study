@@ -1,0 +1,7 @@
+[package]
+name = "mtls_sni_demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boring = "4.0" # Make sure to have cmake/go/perl installed for building boring
