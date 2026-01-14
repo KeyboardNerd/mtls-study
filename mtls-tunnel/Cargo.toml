@@ -2,6 +2,7 @@
 name = "ez_mtls_tunnel"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,6 +14,15 @@ path = "main.rs"
 clap = { version = "4.4.6", features = ["derive"] }
 rcgen = "0.11.1"
 tokio = { version = "1.32.0", features = ["full"] }
-tokio-rustls = "0.24.1"
 rustls = { version = "0.21.7", features = ["dangerous_configuration"] }
 rustls-pemfile = "1.0"
+tonic = { version = "0.10", features = ["tls"] }
+prost = "0.12"
+prost-types = "0.12"
+futures-core = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = "0.4"
+hyper = "0.14"
+
+[build-dependencies]
+tonic-build = "0.10"

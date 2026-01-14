@@ -1,12 +1,24 @@
 use clap::Parser;
-use std::io::BufReader;
+use futures_core::Stream;
+use hyper::Uri;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio_rustls::rustls::{
-    self, Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig,
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnixListenerStream;
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig};
+use tonic::{Request, Response, Status};
+use tower::service_fn;
+
+pub mod tunnel {
+    tonic::include_proto!("tunnel");
+}
+
+use tunnel::{
+    tunnel_client::TunnelClient,
+    tunnel_server::{Tunnel, TunnelServer},
+    EchoRequest, EchoResponse,
 };
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // ----- CA -----
 const CA_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
@@ -60,25 +72,50 @@ struct Args {
     #[clap(long, value_parser)]
     role: String,
 
-    #[clap(long, value_parser)]
+    #[clap(long, value_parser, default_value = "/tmp/mtls.sock")]
     uds_path: String,
 }
 
-fn load_certs_from_pem(pem: &str) -> Vec<Certificate> {
-    let mut reader = BufReader::new(pem.as_bytes());
-    rustls_pemfile::certs(&mut reader)
-        .unwrap()
-        .into_iter()
-        .map(Certificate)
-        .collect()
-}
+#[derive(Debug, Default)]
+pub struct MyTunnel {}
 
-fn load_key_from_pem(pem: &str) -> PrivateKey {
-    let mut reader = BufReader::new(pem.as_bytes());
-    let key = rustls_pemfile::pkcs8_private_keys(&mut reader)
-        .unwrap()
-        .remove(0);
-    PrivateKey(key)
+#[tonic::async_trait]
+impl Tunnel for MyTunnel {
+    async fn echo(&self, request: Request<EchoRequest>) -> Result<Response<EchoResponse>, Status> {
+        println!("Got a request: {:?}", request);
+
+        let reply = EchoResponse {
+            message: format!("Echo: {}", request.into_inner().message),
+        };
+
+        Ok(Response::new(reply))
+    }
+
+    type EchoStreamStream =
+        Pin<Box<dyn Stream<Item = Result<EchoResponse, Status>> + Send + Sync + 'static>>;
+
+    async fn echo_stream(
+        &self,
+        request: Request<EchoRequest>,
+    ) -> Result<Response<Self::EchoStreamStream>, Status> {
+        println!("Got a stream request: {:?}", request);
+
+        let (tx, rx) = mpsc::channel(4);
+
+        tokio::spawn(async move {
+            for i in 0..5 {
+                let reply = EchoResponse {
+                    message: format!("Echo stream {}: {}", i, request.get_ref().message),
+                };
+                tx.send(Ok(reply)).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
+    }
 }
 
 #[tokio::main]
@@ -86,84 +123,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.role == "server" {
-        // Server Mode (Side B)
-        let _ = std::fs::remove_file(&args.uds_path);
-        let listener = UnixListener::bind(&args.uds_path)?;
-        println!("Rust Server listening on {}", args.uds_path);
+        let cert = SERVER_CERT_PEM.to_string();
+        let key = SERVER_KEY_PEM.to_string();
+        let server_identity = Identity::from_pem(cert, key);
 
-        let cert_chain = load_certs_from_pem(SERVER_CERT_PEM);
-        let private_key = load_key_from_pem(SERVER_KEY_PEM);
+        let ca_cert = Certificate::from_pem(CA_CERT_PEM);
 
-        let mut ca_store = RootCertStore::empty();
-        for cert in load_certs_from_pem(CA_CERT_PEM) {
-            ca_store.add(&cert)?;
-        }
-        let client_verifier = rustls::server::AllowAnyAuthenticatedClient::new(ca_store);
+        let tls_config = ServerTlsConfig::new()
+            .identity(server_identity)
+            .client_ca_root(ca_cert);
 
-        let config = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_client_cert_verifier(Arc::new(client_verifier))
-            .with_single_cert(cert_chain, private_key)?;
-        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let tunnel = MyTunnel::default();
+        let uds_path = args.uds_path.clone();
 
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                let mut tls_stream = match acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("TLS Accept error: {}", e);
-                        return;
-                    }
-                };
+        // Remove the old socket if it exists
+        let _ = std::fs::remove_file(&uds_path);
+        let listener = UnixListener::bind(uds_path)?;
+        let listener_stream = UnixListenerStream::new(listener);
 
-                println!("TLS Connection established!");
-                let msg = b"Hello Client";
-                tls_stream.write_all(msg).await.unwrap();
+        println!("TunnelServer listening on {}", args.uds_path);
 
-                let mut buf = [0u8; 1024];
-                let n = tls_stream.read(&mut buf).await.unwrap();
-                println!("Server received: {}", String::from_utf8_lossy(&buf[..n]));
-            });
-        }
+        Server::builder()
+            .tls_config(tls_config)?
+            .add_service(TunnelServer::new(tunnel))
+            .serve_with_incoming(listener_stream)
+            .await?;
     } else {
-        // Client Mode (Side A)
-        let stream = loop {
-            match UnixStream::connect(&args.uds_path).await {
-                Ok(s) => break s,
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
-            }
-        };
+        let server_ca_cert = Certificate::from_pem(CA_CERT_PEM);
+        let client_cert = CLIENT_CERT_PEM.to_string();
+        let client_key = CLIENT_KEY_PEM.to_string();
+        let client_identity = Identity::from_pem(client_cert, client_key);
 
-        let cert_chain = load_certs_from_pem(CLIENT_CERT_PEM);
-        let private_key = load_key_from_pem(CLIENT_KEY_PEM);
+        let tls_config = ClientTlsConfig::new()
+            .domain_name("server.tca")
+            .ca_certificate(server_ca_cert)
+            .identity(client_identity);
 
-        let mut ca_store = RootCertStore::empty();
-        for cert in load_certs_from_pem(CA_CERT_PEM) {
-            ca_store.add(&cert)?;
+        let uds_path = Arc::new(args.uds_path.clone());
+
+        // We need to use a custom connector to connect to a UDS.
+        let channel = Endpoint::try_from("https://[::]:50051")? // dummy URI
+            .tls_config(tls_config)?
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let uds_path = uds_path.clone();
+                async move { UnixStream::connect(uds_path.as_ref()).await }
+            }))
+            .await?;
+
+        let mut client = TunnelClient::new(channel);
+
+        // Unary call
+        let request = tonic::Request::new(EchoRequest {
+            message: "hello".into(),
+        });
+        let response = client.echo(request).await?;
+        println!("RESPONSE={:?}", response);
+
+        // Stream call
+        let request = tonic::Request::new(EchoRequest {
+            message: "hello stream".into(),
+        });
+        let mut stream = client.echo_stream(request).await?.into_inner();
+        while let Some(response) = stream.message().await? {
+            println!("STREAM RESPONSE={:?}", response);
         }
-
-        let config = ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(ca_store)
-            .with_client_auth_cert(cert_chain, private_key)?;
-
-        let connector = TlsConnector::from(Arc::new(config));
-        let domain = rustls::ServerName::try_from("server.tca")?;
-
-        let mut tls_stream = connector.connect(domain, stream).await?;
-        println!("TLS Client Connected!");
-
-        let mut buf = [0u8; 1024];
-        let n = tls_stream.read(&mut buf).await?;
-        println!("Client received: {}", String::from_utf8_lossy(&buf[..n]));
-
-        let msg = b"Hello Server";
-        tls_stream.write_all(msg).await?;
     }
 
     Ok(())

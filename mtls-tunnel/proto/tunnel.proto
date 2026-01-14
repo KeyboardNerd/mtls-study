@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package tunnel;
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}
+
+service Tunnel {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+  rpc EchoStream(EchoRequest) returns (stream EchoResponse);
+}
