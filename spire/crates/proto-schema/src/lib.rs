@@ -11,3 +11,7 @@ pub mod proxy {
     tonic::include_proto!("proxy");
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("proxy_descriptor");
 }
+
+pub mod registry {
+    tonic::include_proto!("registry");
+}

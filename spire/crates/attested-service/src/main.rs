@@ -1,6 +1,7 @@
 mod agent;
 
 use tonic::transport::Server;
+use clap::Parser;
 
 use spiffe_rustls::{mtls_client, mtls_server, TrustDomainPolicy};
 use spiffe::SpiffeId;
@@ -15,6 +16,27 @@ use spiffe::WorkloadApiClient;
 use spiffe::X509Context;
 use spiffe::TrustDomain;
 use proto_schema::ca_authority::echo_service_server::EchoServiceServer;
+use proto_schema::registry::registry_client::RegistryClient;
+use proto_schema::registry::RegistrationRequest;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(long, default_value_t = 9001)]
+    port: u16,
+
+    #[arg(long, default_value_t = 50051)]
+    proxy_port: u16,
+
+    #[arg(long, default_value = "localhost")]
+    sni: String,
+
+    #[arg(long)]
+    registry_addr: Option<String>,
+
+    #[arg(long, default_value = "127.0.0.1")]
+    bind_ip: String,
+}
 
 #[derive(Default)]
 pub struct MyService {}
@@ -30,8 +52,6 @@ impl proto_schema::ca_authority::echo_service_server::EchoService for MyService 
         }))
     }
 }
-
-
 
 use proto_schema::ca_authority::echo_service_client::EchoServiceClient;
 use proto_schema::ca_authority::EchoRequest;
@@ -54,12 +74,8 @@ impl DebugProxy for DebugProxyImpl {
 
         println!("Proxying request to address: {}, sni: {}", address, sni);
 
-        // Calculate source inside the handler or share it? 
-        // For simplicity, we can create a new source or use a shared one. 
-        // Initializing source allows us to be fresh.
         let source = spiffe::X509Source::new().await.map_err(|e| tonic::Status::internal(e.to_string()))?;
 
-        // Custom rule using a closure
         let auth = |peer: &SpiffeId| {
             println!("xxx Peer: {}", peer);
             true 
@@ -107,21 +123,32 @@ impl DebugProxy for DebugProxyImpl {
     }
 }
 
+async fn register_to_registry(registry_addr: String, sni: String, port: u16, ip: String) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Connecting to registry at {}", registry_addr);
+    let mut client = RegistryClient::connect(registry_addr).await?;
+    
+    let request = tonic::Request::new(RegistrationRequest {
+        sni: sni.clone(),
+        ip: ip.clone(),
+        port: port as i32,
+    });
+    
+    let response = client.register(request).await?;
+    println!("Registered {} -> {}:{} : {:?}", sni, ip, port, response.into_inner());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    let args = Args::parse();
     
-    let port = args.iter().position(|r| r == "--port")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.parse::<u16>().unwrap())
-        .unwrap_or(9001);
+    let port = args.port;
+    let proxy_port = args.proxy_port;
+    let sni = args.sni;
+    let registry_addr = args.registry_addr;
+    let bind_ip = args.bind_ip;
 
-    let proxy_port = args.iter().position(|r| r == "--proxy-port")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.parse::<u16>().unwrap())
-        .unwrap_or(50051);
-
-    println!("Starting Attested Service (Echo + Proxy)...");
+    println!("Starting Attested Service (Echo + Proxy)... Bind: {}, Port: {}, Proxy Port: {}, SNI: {}", bind_ip, port, proxy_port, sni);
     
     // Workload API Setup
     let socket_path = format!("unix:/tmp/spiffe-workload-api-{}.sock", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
@@ -144,6 +171,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for agent
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
+    // Register with Registry if address provided
+    if let Some(addr) = registry_addr {
+        let sni_clone = sni.clone();
+        let bind_ip_clone = bind_ip.clone();
+        tokio::spawn(async move {
+            // Retry loop? just once for now
+            if let Err(e) = register_to_registry(addr, sni_clone, port, bind_ip_clone).await {
+               eprintln!("Failed to register: {}", e);
+            }
+        });
+    }
+
     // Start Echo Service (mTLS)
     let echo_server = {
         let source = spiffe::X509Source::new().await?;
@@ -157,7 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_alpn_protocols(&[b"h2"])
             .build()?;
         
-        let addr: std::net::SocketAddr = format!("[::1]:{}", port).parse()?;
+        let addr: std::net::SocketAddr = format!("{}:{}", bind_ip, port).parse()?;
         println!("Echo Service (mTLS) listening on {}", addr);
         
         let listener = TcpListener::bind(addr).await?;
@@ -182,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start Debug Proxy (Plaintext)
     let proxy_server = {
-        let addr: std::net::SocketAddr = format!("[::1]:{}", proxy_port).parse()?;
+        let addr: std::net::SocketAddr = format!("{}:{}", bind_ip, proxy_port).parse()?;
         println!("Debug Proxy listening on {}", addr);
         let reflection_service_v1 = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(proto_schema::proxy::FILE_DESCRIPTOR_SET)

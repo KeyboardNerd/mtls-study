@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package registry;
+
+service Registry {
+    rpc Register(RegistrationRequest) returns (RegistrationResponse);
+}
+
+message RegistrationRequest {
+    string sni = 1;
+    string ip = 2;
+    int32 port = 3;
+}
+
+message RegistrationResponse {
+    bool success = 1;
+    string message = 2;
+}

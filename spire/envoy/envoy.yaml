@@ -1,0 +1,75 @@
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        protocol: TCP
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.sni_dynamic_forward_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.sni_dynamic_forward_proxy.v3.FilterConfig
+          port_value: 9005 # Default port if not present? Or maybe we can rely on something else. 
+          # Actually, we want to route based on SNI to the IP returned by DNS.
+          # The TCP proxy will just use the upstream info set by this filter.
+          dns_cache_config:
+            name: dynamic_forward_proxy_cache_config
+            dns_lookup_family: V4_ONLY
+            dns_refresh_rate: 60s
+            dns_failure_refresh_rate:
+              base_interval: 1s
+              max_interval: 10s
+            dns_query_timeout: 5s
+            typed_dns_resolver_config:
+              name: envoy.network.dns_resolver.cares
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
+                resolvers:
+                - socket_address:
+                    address: "127.0.0.1"
+                    port_value: 10053
+
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: tcp
+          cluster: dynamic_forward_proxy_cluster
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+
+  clusters:
+  - name: dynamic_forward_proxy_cluster
+    connect_timeout: 1s
+    lb_policy: CLUSTER_PROVIDED
+    cluster_type:
+      name: envoy.clusters.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+        dns_cache_config:
+          name: dynamic_forward_proxy_cache_config
+          dns_lookup_family: V4_ONLY
+          dns_refresh_rate: 60s
+          dns_failure_refresh_rate:
+            base_interval: 1s
+            max_interval: 10s
+          dns_query_timeout: 5s
+          # We point to our custom DNS registry
+          # Envoy requires a list of resolving servers.
+          # Since we are running in Docker with host networking or similar, we need to reach 127.0.0.1:10053
+          # However, Envoy's DNS resolver configuration is usually strictly for the cache.
+          # We can use `preresolve_hostnames` or just rely on the system resolver IF we configure the system resolver to use our DNS.
+          # But better: Use `dns_resolution_config` if available in newer Envoy, or just `typed_dns_resolver_config`.
+          # Let's try to use `c-ares` with custom resolvers if supported in `ClusterConfig`? 
+          # Actually `dns_cache_config` has `typed_dns_resolver_config`.
+          typed_dns_resolver_config:
+             name: envoy.network.dns_resolver.cares
+             typed_config:
+                "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
+                resolvers:
+                - socket_address:
+                    address: "127.0.0.1"
+                    port_value: 10053

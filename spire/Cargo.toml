@@ -3,5 +3,6 @@ members = [
     "crates/proto-schema",
     "crates/ca-authority",
     "crates/attested-service",
+    "crates/dns-registry",
 ]
 resolver = "2"
