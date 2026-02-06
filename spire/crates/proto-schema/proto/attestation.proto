@@ -1,0 +1,28 @@
+syntax = "proto3";
+package ca_authority;
+
+service CaService {
+  rpc SignAttestedSvid (AttestationRequest) returns (SignedCertResponse);
+}
+
+message AttestationRequest {
+  bytes csr_der = 1;            // The CSR generated locally
+  bytes endorsement_report = 2; // The Hardware Quote (TPM/TDX)
+}
+
+message SignedCertResponse {
+  bytes certificate_chain = 1;  // The signed SVID
+  bytes trust_bundle = 2;       // The CA's public cert
+}
+
+service EchoService {
+  rpc Echo (EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}

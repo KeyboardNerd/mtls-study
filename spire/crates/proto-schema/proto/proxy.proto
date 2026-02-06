@@ -1,0 +1,16 @@
+syntax = "proto3";
+package proxy;
+
+message CallEchoRequest {
+  string address = 1;
+  string sni = 2;
+  string message = 3;
+}
+
+message CallEchoResponse {
+  string response = 1;
+}
+
+service DebugProxy {
+  rpc CallEcho(CallEchoRequest) returns (CallEchoResponse);
+}

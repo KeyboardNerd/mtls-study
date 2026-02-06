@@ -1,0 +1,21 @@
+[package]
+name = "attested-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = { version = "0.12.3", features = ["tls"] }
+tokio = { version = "1.0", features = ["full"] }
+boring = "4.0"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2.0"
+proto-schema = { path = "../proto-schema" }
+async-trait = "0.1"
+spiffe-rustls = "0.4.6"
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-rustls = "0.26"
+futures-util = "0.3"
+spiffe = "0.11.3"
+tower = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tonic-reflection = "0.12"
