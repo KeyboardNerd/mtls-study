@@ -3,8 +3,6 @@ mod agent;
 use tonic::transport::Server;
 use clap::Parser;
 
-use spiffe_rustls::{mtls_client, mtls_server, TrustDomainPolicy};
-use spiffe::SpiffeId;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_rustls::TlsAcceptor;
@@ -12,12 +10,11 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use boring::pkey::PKey;
 use boring::rsa::Rsa;
-use spiffe::WorkloadApiClient;
-use spiffe::X509Context;
-use spiffe::TrustDomain;
+
 use proto_schema::ca_authority::echo_service_server::EchoServiceServer;
 use proto_schema::registry::registry_client::RegistryClient;
 use proto_schema::registry::RegistrationRequest;
+use crate::agent::{AttestationManager, InProcessClientCertResolver, InProcessServerCertResolver};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -58,8 +55,15 @@ use proto_schema::ca_authority::EchoRequest;
 use proto_schema::proxy::debug_proxy_server::{DebugProxy, DebugProxyServer};
 use proto_schema::proxy::{CallEchoRequest, CallEchoResponse};
 
-#[derive(Default)]
-pub struct DebugProxyImpl {}
+pub struct DebugProxyImpl {
+    manager: Arc<AttestationManager>,
+}
+
+impl DebugProxyImpl {
+    pub fn new(manager: Arc<AttestationManager>) -> Self {
+        Self { manager }
+    }
+}
 
 #[tonic::async_trait]
 impl DebugProxy for DebugProxyImpl {
@@ -74,23 +78,29 @@ impl DebugProxy for DebugProxyImpl {
 
         println!("Proxying request to address: {}, sni: {}", address, sni);
 
-        let source = spiffe::X509Source::new().await.map_err(|e| tonic::Status::internal(e.to_string()))?;
-
-        let auth = |peer: &SpiffeId| {
-            println!("xxx Peer: {}", peer);
-            true 
+        // Build rustls config manually for Client
+        let roots = {
+            let mut roots = rustls::RootCertStore::empty();
+            if let Some(bundle) = self.manager.get_trust_bundle() {
+                 match rustls::pki_types::CertificateDer::try_from(bundle) {
+                     Ok(cert) => {
+                         if let Err(e) = roots.add(cert) {
+                             println!("DebugProxy: Failed to add DER cert to root store: {}", e);
+                         }
+                     }
+                     Err(e) => println!("DebugProxy: Failed to parse trust bundle as DER cert: {}", e),
+                 }
+            }
+            roots
         };
 
-        let client_cfg = mtls_client(source)
-            .authorize(auth)
-            .trust_domain_policy(
-                TrustDomainPolicy::LocalOnly("example.org".try_into().map_err(|e: spiffe::SpiffeIdError| tonic::Status::internal(e.to_string()))?)
-            )
-            .with_alpn_protocols(&[b"h2"]) 
-            .build()
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-        
-        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+        // Re-do builder chain correctly for custom resolver + standard verifier
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(Arc::new(roots)) // Why Arc? rustls 0.23 might take Arc or value? 
+            .with_client_cert_resolver(Arc::new(InProcessClientCertResolver(self.manager.clone())));
+
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
         let sni_clone = sni.clone();
         let address_clone = address.clone();
 
@@ -102,7 +112,14 @@ impl DebugProxy for DebugProxyImpl {
                 let address = address_clone.clone();
                 async move {
                     let stream = tokio::net::TcpStream::connect(&address).await?;
-                    let tls_stream = tls_connector.connect(sni.try_into().unwrap(), stream).await?;
+                    // We must use a valid DNS name for SNI/Validation. 
+                    // If SNI is a SPIFFE ID, this might fail DNS parsing.
+                    // But usually SNI is a hostname.
+                    let domain = rustls::pki_types::ServerName::try_from(sni.as_str())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid SNI: {}", e)))?
+                        .to_owned();
+                        
+                    let tls_stream = tls_connector.connect(domain, stream).await?;
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(hyper_util::rt::TokioIo::new(tls_stream))
                 }
             }))
@@ -140,6 +157,10 @@ async fn register_to_registry(registry_addr: String, sni: String, port: u16, ip:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider(),
+    );
+
     let args = Args::parse();
     
     let port = args.port;
@@ -152,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Workload API Setup
     let socket_path = format!("unix:/tmp/spiffe-workload-api-{}.sock", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    // We still set it for external sidecars if needed, but we don't use it internally
     std::env::set_var("SPIFFE_ENDPOINT_SOCKET", &socket_path);
     println!("SPIFFE_ENDPOINT_SOCKET={}", socket_path);
 
@@ -159,43 +181,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rsa = Rsa::generate(2048)?;
     let private_key = PKey::from_rsa(rsa)?;
 
-    // Start Agent
-    let value = socket_path.clone();
-    let value = value.strip_prefix("unix:").unwrap_or(&value).to_string();
+    // Create Manager
+    let manager = Arc::new(AttestationManager::new(private_key));
+    
+    // Start Manager Refresh Loop
+    let output_manager = manager.clone();
     tokio::spawn(async move {
-        if let Err(e) = agent::run_server(value, private_key).await {
-            eprintln!("Workload API server failed: {}", e);
-        }
+        output_manager.start_refresh_loop().await;
     });
 
-    // Wait for agent
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Start UDS Server (Optional, but keeping for compatibility with sidecars if they look at the path)
+    // let uds_manager = manager.clone();
+    // let value = socket_path.clone();
+    // let value = value.strip_prefix("unix:").unwrap_or(&value).to_string();
+    // tokio::spawn(async move {
+    //     if let Err(e) = agent::run_server(value, uds_manager).await {
+    //         eprintln!("Workload API server failed: {}", e);
+    //     }
+    // });
+
+    // Wait for agent to get first cert?
+    // We can poll until manager.get_certified_key().is_some()
+    loop {
+        if manager.get_certified_key().is_some() {
+             break;
+        }
+        println!("Waiting for SVID attestation...");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 
     // Register with Registry if address provided
     if let Some(addr) = registry_addr {
         let sni_clone = sni.clone();
         let bind_ip_clone = bind_ip.clone();
         tokio::spawn(async move {
-            // Retry loop? just once for now
             if let Err(e) = register_to_registry(addr, sni_clone, port, bind_ip_clone).await {
                eprintln!("Failed to register: {}", e);
             }
         });
     }
 
+    // Wait for the manager to have the trust bundle
+    loop {
+        if manager.get_trust_bundle().is_some() {
+            println!("Trust bundle is available.");
+            break;
+        }
+        println!("Waiting for trust bundle...");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
     // Start Echo Service (mTLS)
     let echo_server = {
-        let source = spiffe::X509Source::new().await?;
-        let auth = |peer: &SpiffeId| {
-            println!("xxx Peer: {}", peer);
-            true 
-        };
-        let server_config = mtls_server(source)
-            .authorize(auth)
-            .trust_domain_policy(TrustDomainPolicy::LocalOnly("example.org".try_into()?))
-            .with_alpn_protocols(&[b"h2"])
-            .build()?;
+        let manager_clone = manager.clone();
         
+        // Build Server Verifier
+        let roots = {
+             let mut roots = rustls::RootCertStore::empty();
+             if let Some(bundle) = manager_clone.get_trust_bundle() {
+                 match rustls::pki_types::CertificateDer::try_from(bundle) {
+                     Ok(cert) => {
+                         if let Err(e) = roots.add(cert) {
+                             eprintln!("Failed to add DER cert to root store: {}", e);
+                         }
+                     }
+                     Err(e) => eprintln!("Failed to parse trust bundle as DER cert: {}", e),
+                 }
+            } 
+            roots
+        };
+        
+        // Use basic WebPki verifier with NO client auth? No, we WANT client auth (mTLS).
+        // .with_client_cert_verifier(WebPkiClientVerifier...)
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| format!("Verifier build error: {}", e))?;
+            
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(Arc::new(InProcessServerCertResolver(manager_clone.clone())));
+            
+        // We probably need ALPN h2
+        let mut server_config = server_config;
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+
         let addr: std::net::SocketAddr = format!("{}:{}", bind_ip, port).parse()?;
         println!("Echo Service (mTLS) listening on {}", addr);
         
@@ -219,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve_with_incoming(incoming)
     };
 
-    // Start Debug Proxy (Plaintext)
+    // Start Debug Proxy (Plaintext gRPC, but calls Echo via mTLS)
     let proxy_server = {
         let addr: std::net::SocketAddr = format!("{}:{}", bind_ip, proxy_port).parse()?;
         println!("Debug Proxy listening on {}", addr);
@@ -233,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Server::builder()
             .add_service(reflection_service_v1)
             .add_service(reflection_service_v1alpha)
-            .add_service(DebugProxyServer::new(DebugProxyImpl::default()))
+            .add_service(DebugProxyServer::new(DebugProxyImpl::new(manager.clone())))
             .serve(addr)
     };
 
